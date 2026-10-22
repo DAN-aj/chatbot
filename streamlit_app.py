@@ -1,56 +1,250 @@
+"""Talk to Documents: a complete session-scoped RAG app for Streamlit Cloud."""
+import os
+from pathlib import Path
+
 import streamlit as st
-from openai import OpenAI
+from dotenv import load_dotenv
+from openai import OpenAI, OpenAIError
+from streamlit_pdf_viewer import pdf_viewer
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
-)
+from cloud_rag import answer_question, index_document, new_store, remove_document
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+# Cloud uses Streamlit secrets; a local .env is convenient for development.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+st.set_page_config(page_title="Talk to Documents", page_icon="📄", layout="wide")
+st.markdown("""
+<style>
+    .block-container {max-width: 1440px; padding-top: 2rem;}
+    [data-testid="stSidebar"] {background: #f7f8fa;}
+    [data-testid="stChatMessage"] {border: 1px solid #e7e9ed; border-radius: 16px;}
+    .subtitle {color: #667085; font-size: 0.95rem; margin-top: -0.7rem;}
+</style>
+""", unsafe_allow_html=True)
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+# All documents, vectors, and chat messages belong to the current browser session.
+for key, default in {
+    "documents": {}, "conversations": {}, "citation": None,
+    "upload_key": 0, "indexing": False, "answering": False, "notice": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+if "vectors" not in st.session_state:
+    st.session_state.vectors = new_store()
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
+def configured_api_key() -> str:
+    """Read a server-owned key without exposing it in the interface."""
+    value = os.getenv("OPENAI_API_KEY", "")
+    if value:
+        return value
+    try:
+        return str(st.secrets["OPENAI_API_KEY"])
+    except (FileNotFoundError, KeyError):
+        return ""
+
+
+def show_answer(message: dict, message_index: int) -> None:
+    """Render grounded text and compact numbered citation controls."""
+    st.markdown(message["content"])
+    sources = message.get("sources", [])
+    if not sources:
+        return
+    st.caption("Sources · select a citation to inspect the original page")
+    columns = st.columns(min(len(sources), 4))
+    for index, source in enumerate(sources):
+        number = source.get("citation_id", index + 1)
+        page = source.get("page_number")
+        label = f"[{number}] {source['filename']}"
+        if page:
+            label += f" · p. {page}"
+        with columns[index % len(columns)]:
+            if st.button(label, key=f"cite_{message_index}_{index}",
+                         use_container_width=True):
+                st.session_state.citation = source
+                st.rerun()
+
+
+def show_citation(source: dict) -> None:
+    """Render the PDF beside the chat at its exact highlighted coordinates."""
+    st.subheader("Source viewer")
+    st.caption(source["filename"])
+    locations = source.get("locations") or [source]
+    page_locations = [item for item in locations if item.get("page_number")]
+    if page_locations:
+        location = st.selectbox(
+            "Cited page", page_locations,
+            format_func=lambda item: f"{item.get('filename', source['filename'])} · "
+            f"page {item['page_number']} · "
+            f"{', '.join(item.get('paragraph_ids', [])) or 'passage'}",
+            key=f"location_{source['source']}_{source['chunk_id']}")
+        page = int(location["page_number"])
+        location_source = location.get("source", source["source"])
+        box = location.get("bbox")
+        annotations = []
+        if box:
+            annotations = [{
+                "page": page, "x": box[0], "y": box[1],
+                "width": box[2] - box[0], "height": box[3] - box[1],
+                "color": "#F9B84A",
+            }]
+        document = st.session_state.documents.get(location_source)
+        if document:
+            pdf_viewer(
+                document["data"], height=680, width="100%",
+                key=f"pdf_{location_source}_{page}_{box}",
+                annotations=annotations, pages_to_render=[page],
+                scroll_to_annotation=1 if annotations else None,
+                scroll_to_page=None if annotations else page)
+        else:
+            st.warning("The original PDF is no longer in this session.")
+    else:
+        st.info("This citation comes from a text document.")
+    with st.expander("Read cited passage"):
+        st.write(source.get("text", ""))
+
+
+with st.sidebar:
+    st.title("📄 Documents")
+    st.caption("Files and vectors are held temporarily in this app session.")
+
+    server_key = configured_api_key()
+    if server_key:
+        api_key = server_key
+        st.caption("Language model access is configured for this app.")
+    else:
+        with st.expander("OpenAI API key", expanded=True):
+            api_key = st.text_input(
+                "API key", type="password", key="visitor_api_key",
+                help="Used for multilingual embeddings and answers in this session.")
+            st.caption("Your key is held in this session and is not saved to the repository.")
+
+    st.divider()
+    uploaded_file = st.file_uploader(
+        "Upload a PDF or TXT file", type=["pdf", "txt"],
+        key=f"upload_{st.session_state.upload_key}")
+    st.caption("Up to 20 MiB. PDF text must be selectable; scans need OCR.")
+    st.caption("Uploaded text is sent to OpenAI for embeddings and answers.")
+    can_upload = (uploaded_file is not None and bool(api_key)
+                  and not st.session_state.indexing
+                  and len(st.session_state.documents) < 5)
+    if len(st.session_state.documents) >= 5:
+        st.info("This session holds up to five documents. Remove one to add another.")
+    if st.button("Add document", type="primary", use_container_width=True,
+                 disabled=not can_upload):
+        status = st.status("Indexing document…", expanded=True)
+        bar = st.progress(0)
+        st.session_state.indexing = True
+        try:
+            data = uploaded_file.getvalue()
+            client = OpenAI(api_key=api_key, timeout=90, max_retries=2)
+
+            def progress(percent: int, stage: str) -> None:
+                bar.progress(percent, text=stage)
+
+            document = index_document(
+                st.session_state.vectors, client, data, uploaded_file.name, progress)
+            document["data"] = data
+            st.session_state.documents[document["id"]] = document
+            st.session_state.upload_key += 1
+            st.session_state.notice = ("success", f"{document['filename']} is ready.")
+            status.update(label="Document ready", state="complete")
+            st.rerun()
+        except (ValueError, OpenAIError, RuntimeError, OSError) as exc:
+            status.update(label="Indexing failed", state="error")
+            st.error(str(exc))
+        finally:
+            st.session_state.indexing = False
+
+    if st.session_state.notice:
+        kind, message = st.session_state.notice
+        (st.success if kind == "success" else st.error)(message)
+        st.session_state.notice = None
+
+    st.divider()
+    documents = st.session_state.documents
+    choices = [None, *documents]
+    selected = st.selectbox(
+        "Chat with", choices,
+        format_func=lambda source: "Select a document" if source is None else
+        f"{documents[source]['filename']} · {source[:8]} · Ready")
+    if selected:
+        current = documents[selected]
+        st.caption(f"{current['chunk_count']} passages · "
+                   f"{current['page_count'] or 0} pages")
+
+    with st.expander("Advanced settings"):
+        top_k = st.slider("Maximum sources", 1, 10, 3)
+        threshold = st.slider("Similarity threshold", 0.0, 1.0, 0.55, 0.05)
+        st.caption("Lower the threshold if relevant passages are missing.")
+    if selected and st.button("Clear conversation", use_container_width=True):
+        st.session_state.conversations[selected] = []
+        st.session_state.citation = None
+        st.rerun()
+    if selected and st.button("Remove document", use_container_width=True):
+        remove_document(st.session_state.vectors, selected)
+        del st.session_state.documents[selected]
+        st.session_state.conversations.pop(selected, None)
+        st.session_state.citation = None
+        st.rerun()
+
+st.title("Talk to Documents")
+st.markdown(
+    '<p class="subtitle">Ask questions grounded in your documents. '
+    'Select a source to inspect its original page.</p>',
+    unsafe_allow_html=True)
+if not api_key:
+    st.info("Add an OpenAI API key in the sidebar to begin.")
+elif not selected:
+    st.info("Upload and select a document to start a conversation.")
+
+# The viewer stays beside the conversation for direct source inspection.
+chat_column, viewer_column = st.columns([1.25, 1], gap="large")
+with chat_column:
+    messages = st.session_state.conversations.setdefault(selected, [])
+    for message_index, message in enumerate(messages):
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+            if message["role"] == "assistant":
+                show_answer(message, message_index)
+            else:
+                st.markdown(message["content"])
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
-
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
-
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
+    ready = bool(selected and api_key and not st.session_state.indexing
+                 and not st.session_state.answering)
+    question = st.chat_input(
+        "Ask a question about this document…", disabled=not ready)
+    if question:
+        messages.append({"role": "user", "content": question})
+        st.session_state.answering = True
         with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+            with st.status("Searching and composing an answer…", expanded=True):
+                bar = st.progress(0)
+
+                def progress(percent: int, stage: str) -> None:
+                    bar.progress(percent, text=stage)
+
+                try:
+                    client = OpenAI(api_key=api_key, timeout=90, max_retries=2)
+                    history = [
+                        {"role": item["role"], "content": item["content"]}
+                        for item in messages[:-1][-6:]]
+                    result = answer_question(
+                        st.session_state.vectors, client, selected, question,
+                        top_k, threshold, history, progress)
+                    messages.append({
+                        "role": "assistant", "content": result["answer"],
+                        "sources": result.get("sources", [])})
+                except (ValueError, OpenAIError, RuntimeError, OSError) as exc:
+                    messages.append({
+                        "role": "assistant",
+                        "content": f"I couldn't answer this question: {exc}"})
+                finally:
+                    st.session_state.answering = False
+        st.rerun()
+
+with viewer_column:
+    citation = st.session_state.citation
+    if citation and citation.get("source") == selected:
+        show_citation(citation)
+    else:
+        st.subheader("Source viewer")
+        st.caption("Select a numbered citation below an answer to inspect its PDF page.")

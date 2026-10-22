@@ -1,2 +1,6 @@
-streamlit
-openai
+streamlit>=1.59,<2
+streamlit-pdf-viewer>=0.0.30,<0.1
+openai>=2,<3
+qdrant-client>=1.14,<2
+pdfplumber>=0.11,<1
+python-dotenv>=1,<2
