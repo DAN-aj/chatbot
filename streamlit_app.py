@@ -4,10 +4,10 @@ from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
 from streamlit_pdf_viewer import pdf_viewer
 
 from cloud_rag import answer_question, index_document, new_store, remove_document
+from providers import create_provider
 
 # Cloud uses Streamlit secrets; a local .env is convenient for development.
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -32,15 +32,33 @@ if "vectors" not in st.session_state:
     st.session_state.vectors = new_store()
 
 
-def configured_api_key() -> str:
-    """Read a server-owned key without exposing it in the interface."""
-    value = os.getenv("OPENAI_API_KEY", "")
+def configured_api_key(provider: str) -> str:
+    """Read only the chosen provider's server-owned key."""
+    name = "GEMINI_API_KEY" if provider == "Gemini" else "OPENAI_API_KEY"
+    value = os.getenv(name, "")
     if value:
         return value
     try:
-        return str(st.secrets["OPENAI_API_KEY"])
+        return str(st.secrets[name])
     except (FileNotFoundError, KeyError):
         return ""
+
+
+def friendly_error(exc: Exception, provider: str) -> str:
+    """Turn service errors into actionable text without leaking request data."""
+    detail = str(exc).lower()
+    if provider == "OpenAI" and any(term in detail for term in (
+            "credit_balance_exhausted", "insufficient_quota", "no credits remaining")):
+        return ("OpenAI API đã hết tín dụng. Chọn Gemini trong thanh bên và "
+                "nhập Gemini API key, hoặc nạp tín dụng OpenAI để tiếp tục.")
+    if "429" in detail or "resource_exhausted" in detail:
+        return (f"{provider} đang giới hạn lượt sử dụng. Hãy đợi rồi thử lại "
+                "hoặc kiểm tra quota của API key.")
+    if "401" in detail or "403" in detail or "api key not valid" in detail:
+        return f"Không thể xác thực {provider} API key. Hãy kiểm tra lại key."
+    if isinstance(exc, ValueError):
+        return str(exc)
+    return f"Không thể xử lý yêu cầu với {provider}. Kiểm tra API key và thử lại."
 
 
 def show_answer(message: dict, message_index: int) -> None:
@@ -107,23 +125,37 @@ with st.sidebar:
     st.title("📄 Documents")
     st.caption("Files and vectors are held temporarily in this app session.")
 
-    server_key = configured_api_key()
+    if "provider_choice" not in st.session_state:
+        st.session_state.provider_choice = (
+            "OpenAI" if st.session_state.documents or
+            (st.session_state.get("visitor_openai_key") and
+             not configured_api_key("Gemini")) else "Gemini")
+    provider = st.radio(
+        "AI provider", ["Gemini", "OpenAI"], horizontal=True,
+        key="provider_choice", disabled=bool(st.session_state.documents),
+        help="Remove all documents before switching provider; their vectors "
+             "were created by the selected model.")
+    server_key = configured_api_key(provider)
     if server_key:
         api_key = server_key
         st.caption("Language model access is configured for this app.")
     else:
-        with st.expander("OpenAI API key", expanded=True):
+        with st.expander(f"{provider} API key", expanded=True):
             api_key = st.text_input(
-                "API key", type="password", key="visitor_api_key",
+                "API key", type="password",
+                key=f"visitor_{provider.lower()}_key",
                 help="Used for multilingual embeddings and answers in this session.")
             st.caption("Your key is held in this session and is not saved to the repository.")
+            if provider == "Gemini":
+                st.caption("Create a key in [Google AI Studio](https://aistudio.google.com/api-keys). "
+                           "Free-tier usage has rate limits and may be used to improve Google's products.")
 
     st.divider()
     uploaded_file = st.file_uploader(
         "Upload a PDF or TXT file", type=["pdf", "txt"],
         key=f"upload_{st.session_state.upload_key}")
     st.caption("Up to 20 MiB. PDF text must be selectable; scans need OCR.")
-    st.caption("Uploaded text is sent to OpenAI for embeddings and answers.")
+    st.caption(f"Uploaded text is sent to {provider} for embeddings and answers.")
     can_upload = (uploaded_file is not None and bool(api_key)
                   and not st.session_state.indexing
                   and len(st.session_state.documents) < 5)
@@ -136,7 +168,7 @@ with st.sidebar:
         st.session_state.indexing = True
         try:
             data = uploaded_file.getvalue()
-            client = OpenAI(api_key=api_key, timeout=90, max_retries=2)
+            client = create_provider(provider, api_key)
 
             def progress(percent: int, stage: str) -> None:
                 bar.progress(percent, text=stage)
@@ -149,9 +181,9 @@ with st.sidebar:
             st.session_state.notice = ("success", f"{document['filename']} is ready.")
             status.update(label="Document ready", state="complete")
             st.rerun()
-        except (ValueError, OpenAIError, RuntimeError, OSError) as exc:
+        except Exception as exc:
             status.update(label="Indexing failed", state="error")
-            st.error(str(exc))
+            st.error(friendly_error(exc, provider))
         finally:
             st.session_state.indexing = False
 
@@ -193,7 +225,7 @@ st.markdown(
     'Select a source to inspect its original page.</p>',
     unsafe_allow_html=True)
 if not api_key:
-    st.info("Add an OpenAI API key in the sidebar to begin.")
+    st.info(f"Add a {provider} API key in the sidebar to begin.")
 elif not selected:
     st.info("Upload and select a document to start a conversation.")
 
@@ -223,20 +255,20 @@ with chat_column:
                     bar.progress(percent, text=stage)
 
                 try:
-                    client = OpenAI(api_key=api_key, timeout=90, max_retries=2)
+                    client = create_provider(provider, api_key)
                     history = [
                         {"role": item["role"], "content": item["content"]}
-                        for item in messages[:-1][-6:]]
+                        for item in messages[:-1] if not item.get("error")][-6:]
                     result = answer_question(
                         st.session_state.vectors, client, selected, question,
                         top_k, threshold, history, progress)
                     messages.append({
                         "role": "assistant", "content": result["answer"],
                         "sources": result.get("sources", [])})
-                except (ValueError, OpenAIError, RuntimeError, OSError) as exc:
+                except Exception as exc:
                     messages.append({
                         "role": "assistant",
-                        "content": f"I couldn't answer this question: {exc}"})
+                        "content": friendly_error(exc, provider), "error": True})
                 finally:
                     st.session_state.answering = False
         st.rerun()
