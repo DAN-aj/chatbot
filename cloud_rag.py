@@ -373,7 +373,8 @@ def _generate(client: OpenAI, question: str, sources: list[dict],
             "Cite supporting passages inline as [1], [2], etc. If the passages "
             "do not support an answer, say so clearly without inventing facts."
         ),
-        input=prompt, max_output_tokens=900, store=False)
+        input=prompt, max_output_tokens=900, store=False,
+        reasoning={"effort": "none"})
     answer = (response.output_text or "").strip()
     if not answer:
         raise RuntimeError("The language model returned an empty answer.")
