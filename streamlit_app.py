@@ -1,5 +1,6 @@
 """Talk to Documents: a complete session-scoped RAG app for Streamlit Cloud."""
 import os
+import logging
 from pathlib import Path
 
 import streamlit as st
@@ -7,7 +8,7 @@ from dotenv import load_dotenv
 from streamlit_pdf_viewer import pdf_viewer
 
 from cloud_rag import answer_question, index_document, new_store, remove_document
-from providers import create_provider
+from providers import ProviderOperationError, create_provider
 
 # Cloud uses Streamlit secrets; a local .env is convenient for development.
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -46,16 +47,31 @@ def configured_api_key(provider: str) -> str:
 
 def friendly_error(exc: Exception, provider: str) -> str:
     """Turn service errors into actionable text without leaking request data."""
-    detail = str(exc).lower()
+    root = exc.cause if isinstance(exc, ProviderOperationError) else exc
+    detail = str(root).lower()
+    stage = ("tạo câu trả lời" if getattr(exc, "stage", "") == "answer"
+             else "tạo embedding")
+    code = getattr(root, "code", getattr(root, "status_code", None))
     if provider == "OpenAI" and any(term in detail for term in (
             "credit_balance_exhausted", "insufficient_quota", "no credits remaining")):
         return ("OpenAI API đã hết tín dụng. Chọn Gemini trong thanh bên và "
                 "nhập Gemini API key, hoặc nạp tín dụng OpenAI để tiếp tục.")
-    if "429" in detail or "resource_exhausted" in detail:
-        return (f"{provider} đang giới hạn lượt sử dụng. Hãy đợi rồi thử lại "
+    if code == 429 or "429" in detail or "resource_exhausted" in detail:
+        return (f"{provider} đang giới hạn lượt sử dụng khi {stage}. Hãy đợi rồi thử lại "
                 "hoặc kiểm tra quota của API key.")
-    if "401" in detail or "403" in detail or "api key not valid" in detail:
+    if (code in (401, 403) or "401" in detail or "403" in detail
+            or "api key not valid" in detail or "api_key_invalid" in detail):
         return f"Không thể xác thực {provider} API key. Hãy kiểm tra lại key."
+    if "returned an empty answer" in detail:
+        return (f"{provider} không trả về nội dung ở bước {stage}. "
+                "Hãy thử câu hỏi ngắn hơn hoặc kiểm tra Manage app → Logs.")
+    if code == 404 or "not found" in detail:
+        return (f"{provider} không cho API key này truy cập mô hình "
+                f"{getattr(exc, 'model', '')} ở bước {stage} (HTTP 404).")
+    if isinstance(exc, ProviderOperationError):
+        status = f"HTTP {code}" if code is not None else type(root).__name__
+        return (f"{provider} gặp lỗi khi {stage} bằng {exc.model} ({status}). "
+                "Mở Manage app → Logs để xem chi tiết; không gửi API key.")
     if isinstance(exc, ValueError):
         return str(exc)
     return f"Không thể xử lý yêu cầu với {provider}. Kiểm tra API key và thử lại."
@@ -182,6 +198,7 @@ with st.sidebar:
             status.update(label="Document ready", state="complete")
             st.rerun()
         except Exception as exc:
+            logging.exception("Document indexing failed")
             status.update(label="Indexing failed", state="error")
             st.error(friendly_error(exc, provider))
         finally:
@@ -266,6 +283,7 @@ with chat_column:
                         "role": "assistant", "content": result["answer"],
                         "sources": result.get("sources", [])})
                 except Exception as exc:
+                    logging.exception("Document question failed")
                     messages.append({
                         "role": "assistant",
                         "content": friendly_error(exc, provider), "error": True})

@@ -6,6 +6,16 @@ from google.genai import types
 from openai import OpenAI
 
 
+class ProviderOperationError(RuntimeError):
+    """Keep the failed operation and model attached to an API exception."""
+
+    def __init__(self, stage: str, model: str, cause: Exception) -> None:
+        self.stage = stage
+        self.model = model
+        self.cause = cause
+        super().__init__(f"{stage} failed with {model}")
+
+
 class OpenAIProvider:
     """Use OpenAI for multilingual vectors and grounded answer generation."""
 
@@ -20,9 +30,12 @@ class OpenAIProvider:
 
     def generate(self, prompt: str, instructions: str) -> str:
         """Ask the Responses API for one cited answer."""
-        response = self.client.responses.create(
-            model="gpt-6-luna", instructions=instructions, input=prompt,
-            max_output_tokens=900, store=False, reasoning={"effort": "none"})
+        try:
+            response = self.client.responses.create(
+                model="gpt-6-luna", instructions=instructions, input=prompt,
+                max_output_tokens=900, store=False, reasoning={"effort": "none"})
+        except Exception as exc:
+            raise ProviderOperationError("answer", "gpt-6-luna", exc) from exc
         return (response.output_text or "").strip()
 
 
@@ -47,10 +60,15 @@ class GeminiProvider:
 
     def generate(self, prompt: str, instructions: str) -> str:
         """Generate a grounded answer in the user's language."""
-        response = self.client.models.generate_content(
-            model="gemini-2.5-flash", contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=instructions, max_output_tokens=900))
+        model = "gemini-3.5-flash-lite"
+        try:
+            response = self.client.models.generate_content(
+                model=model, contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=instructions, max_output_tokens=1800,
+                    thinking_config=types.ThinkingConfig(thinking_level="minimal")))
+        except Exception as exc:
+            raise ProviderOperationError("answer", model, exc) from exc
         return (response.text or "").strip()
 
 

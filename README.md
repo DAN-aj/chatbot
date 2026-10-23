@@ -26,7 +26,7 @@ Do not commit an API key to GitHub.
    `text-embedding-3-small` embeds unique passages.
    Qdrant local mode stores vectors inside the current Streamlit session.
 4. A question performs one cosine search with a default score threshold of
-   0.55, then `gemini-2.5-flash` or `gpt-6-luna` answers from the retrieved passages. Broad summary
+   0.55, then `gemini-3.5-flash-lite` or `gpt-6-luna` answers from the retrieved passages. Broad summary
    requests read the full document, using section reduction for long files.
 5. Numbered citations open the original PDF page beside the chat and highlight
    the measured source location.
