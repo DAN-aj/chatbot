@@ -1,9 +1,15 @@
 # Talk to Documents
 
-A PDF/TXT RAG chatbot designed to run inside one Streamlit Community Cloud app.
-It replaces the former GPT-3.5 chatbot template.
+Ứng dụng hỏi đáp tài liệu PDF/TXT bằng RAG. Repository có hai cách chạy độc lập:
 
-## Run locally
+| Phiên bản | Mã nguồn | Cách chạy | Lưu trữ |
+| --- | --- | --- | --- |
+| [Streamlit Cloud](https://chatbot-ni241maz32f.streamlit.app/) | `streamlit_app.py`, `cloud_rag.py`, `providers.py` | Một ứng dụng Streamlit; không cần FastAPI | Qdrant local và tài liệu trong phiên Streamlit |
+| FastAPI + Qdrant | [`backend/`](backend/README.md) | API, Qdrant server và Streamlit client chạy riêng | File, trạng thái tác vụ và vector lưu bền trên máy chủ |
+
+## Chạy ứng dụng Streamlit Cloud ở máy cá nhân
+
+Yêu cầu Python 3.11 trở lên:
 
 ```bash
 python3 -m venv .venv
@@ -12,35 +18,25 @@ python -m pip install -r requirements.txt
 python -m streamlit run streamlit_app.py
 ```
 
-Add `OPENAI_API_KEY` to an uncommitted `.env` file, or enter your own key in the
-app sidebar. On Streamlit Community Cloud, set `OPENAI_API_KEY` in the app's
-Settings → Secrets to let visitors use the chatbot without supplying a key.
-Do not commit an API key to GitHub.
+Nhập Gemini API key hoặc OpenAI API key trong sidebar. Người quản trị có thể đặt
+`GEMINI_API_KEY` hoặc `OPENAI_API_KEY` trong **Streamlit Cloud → Settings → Secrets**
+để khách truy cập dùng khóa của ứng dụng. Khi chạy cục bộ, có thể dùng file `.env`
+không commit. Gemini là nhà cung cấp mặc định nếu chưa chọn nhà cung cấp khác.
+OpenAI cần tài khoản còn hạn mức API; mỗi nhà cung cấp có giới hạn lưu lượng riêng.
 
-## How it works
+Ứng dụng nhận PDF có lớp chữ chọn được và TXT UTF-8, tối đa 20 MiB. Nội dung được
+gửi tới nhà cung cấp AI đã chọn để tạo embedding và câu trả lời. Với PDF scan,
+hãy OCR trước khi tải lên phiên bản Cloud. Chỉ đổi nhà cung cấp sau khi đã xóa
+tài liệu trong phiên, vì vector của hai mô hình embedding không tương thích.
 
-1. Upload a selectable-text PDF or UTF-8 TXT file, up to 20 MiB.
-2. `pdfplumber` extracts text with page numbers, paragraph IDs and measured PDF
-   bounding boxes. The app packs passages by page and merges duplicate text.
-3. Gemini's multilingual `gemini-embedding-2` or OpenAI's multilingual
-   `text-embedding-3-small` embeds unique passages.
-   Qdrant local mode stores vectors inside the current Streamlit session.
-4. A question performs one cosine search with a default score threshold of
-   0.55, then `gemini-3.5-flash-lite` or `gpt-6-luna` answers from the retrieved passages. Broad summary
-   requests read the full document, using section reduction for long files.
-5. Numbered citations open the original PDF page beside the chat and highlight
-   the measured source location.
+Mỗi phiên Streamlit giữ tài liệu, vector và lịch sử chat riêng. Dữ liệu có thể
+mất khi phiên hoặc ứng dụng khởi động lại. Đây không phải kho lưu trữ lâu dài
+cho nhiều người dùng. Không commit khóa API hoặc tài liệu riêng tư lên GitHub.
 
-Uploaded text is sent to the selected AI provider for embeddings and answers. Each browser
-session has its own documents, vectors, and chat history. Streamlit Community
-Cloud does not guarantee persistence for generated files, so documents are
-lost when the session or app restarts. Upload them again to continue. If
-persistent documents across sessions are required, add external storage and
-authentication before using the app for private data.
+## FastAPI + Qdrant
 
-The app accepts either `GEMINI_API_KEY` or `OPENAI_API_KEY` in Streamlit Secrets,
-the local `.env`, or a visitor's sidebar input. Gemini is the default when no
-provider is configured and its free tier has rate limits; OpenAI requires
-available API credit. Documents must be removed before changing providers,
-because their vectors come from a different embedding model. If a document is
-a scan without a text layer, run OCR before uploading it.
+Phiên bản [`backend/`](backend/README.md) hỗ trợ lập chỉ mục nền có theo dõi
+tiến độ, phân tích bố cục PDF, bảng, hình/biểu đồ bằng Vision khi cấu hình
+Gemini, truy xuất child-to-parent và câu trả lời có trích dẫn vị trí trang PDF.
+Nó chạy độc lập với ứng dụng Streamlit Cloud ở thư mục gốc. Xem hướng dẫn cài
+đặt, biến môi trường và API trong [README backend](backend/README.md).

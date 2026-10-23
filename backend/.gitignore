@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+.pytest_cache/
+uploads/*
+!uploads/.gitkeep
+.env
+.streamlit/secrets.toml
+var/

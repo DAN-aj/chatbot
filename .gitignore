@@ -1,4 +1,6 @@
 .streamlit/secrets.toml
+backend/uploads/
+backend/var/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
